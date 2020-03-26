@@ -1,10 +1,15 @@
 package main
 
+/*
+	fatalf and fatalln may have to be replaced from everything except for authenticateServer as it stops the program
+*/
+
 import (
 	"log"
 	"firebase.google.com/go"
 	"firebase.google.com/go/auth"
-	//"net/http" // UNCOMMENT this when using http package
+	"net/http" // UNCOMMENT this when using http package
+	"encoding/json"
 	"golang.org/x/net/context"
 	"google.golang.org/api/option"
 	"fmt"
@@ -14,9 +19,13 @@ var app *firebase.App
 
 //specify user interface
 type User struct {
-    rank int 'json:"rank"'
-    username string 'json:"username"'
-    score float64 'json:"score"'
+    rank int `json:"rank"`
+    username string `json:"username"`
+    score float64 `json:"score"`
+}
+
+type requestMessage struct {
+	auth string `json:"auth"`
 }
 
 func main() {
@@ -36,6 +45,16 @@ func main() {
         log.Fatalln("Error reading from database:", err)
 	}
 	fmt.Println(data)
+	
+	go func() {
+		log.Fatal(http.ListenAndServe("localhost:420/api/conversation/receive/:cid", http.HandlerFunc(receiveMessageHandler)))
+	} ()
+
+	go func() {
+		log.Fatal(http.ListenAndServe("localhost:421/api/leaderboards", http.HandlerFunc(leaderboardHandler)))
+	} ()
+
+	log.Fatal(http.ListenAndServe("localhost:430", nil))
 }
 
 // This method should be called on initialization
@@ -75,10 +94,7 @@ func checkUserAuthentication(idToken string) (*auth.Token, error) {
 }
 
 func leaderboardHandler() {
-	///listener
-	log.Fatal(http.ListenAndServer("/api/leaderboards", http.HandlerFunc(requestHandler)))
-
-
+	ctx := context.Background()
   // Create a database client from App.
   client, err := app.Database(ctx)
   if err != nil {
@@ -89,18 +105,76 @@ func leaderboardHandler() {
   ref := client.NewRef("?")
 
   // Read the data at the posts reference (this is a blocking operation)
-  var post Post
-  if err := ref.Get(ctx, &post); err != nil {
+  var user User
+  if err := ref.Get(ctx, &user); err != nil {
           log.Fatalln("Error reading value:", err)
   }
 
   //arrange the users in database by score
-  ref := client.NewUser("leaderboards")
+  ref := client.NewRef("leaderboards")
 
   result, err := ref.OrderByValue().GetOrdered(ctx)
   if err != nil {
         log.Fatalln("Error querying database:", err)
   }
+}
+
+// handler for when a call to a url is reached to get the messages
+func receiveMessageHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	cid := r.URL.Path[len("/api/conversation/receive/"):]
+	var receiveMessageRequest requestMessage
+
+	err := json.NewDecoder(r.Body).Decode(&receiveMessageRequest)
+	// places all the data from the body into receiveMessageRequest and puts an error into err
+	if err != nil {
+		log.Printf("JSON decoding failed %v: ", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// now we have the cid and the user auth
+
+	idToken, err := checkUserAuthentication(receiveMessageRequest.auth)	// validate the user  is real
+	if err != nil {
+		log.Printf("Error authenticating user %v: ", err)
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	id := idToken.UID
+
+	// user is authenticated and the we have cid and user auth, now we can look to get all the data
+	client, err := app.Database(ctx)
+	if err != nil {
+		log.Fatalln("Error initializing database client: ", err)
+	}
+
+	// need to use decrypted data to go into firebase, find the correct chat room and then collect
+	// all of the messages from that one person in that chat room
+
+	// have:
+	//					 cid
+	// 					 userId
+	//					 database client
+	// want to: get database reference, go into chatRoom with corresponding cid, collect all of the
+	// messages with the userId that we have, put them into w and then return
+
+	// ref to the chatRooms, query on it to find the chat room we want
+	address := "chatRooms" + cid
+	chatRoomRef := client.NewRef(address)
+	messages, err := chatRoomRef.OrderByChild(address + "/id").EqualTo(id).GetOrdered(ctx)
+	if err != nil {
+		log.Fatalln("Error getting messages %v: ", err)
+	}
+
+	responseJSON, err := json.Marshal(messages)
+	if err != nil {
+		log.Printf("Marshalling failed: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write(responseJSON)
+	return
 }
 
 // TODO remove this later
